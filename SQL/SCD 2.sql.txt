@@ -1,0 +1,98 @@
+CREATE OR REPLACE PROCEDURE sp_load_customer_scd2()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    -- Step 0: Load the CDC stream into a temporary table
+    CREATE OR REPLACE TEMP TABLE temp_customer_stream AS
+    SELECT 
+        customer_id,
+        first_name,
+        last_name,
+        email,
+        street,
+        city,
+        state,
+        country,
+        update_timestamp,
+        METADATA$ACTION AS action,
+        METADATA$ISUPDATE AS is_update
+    FROM customer_table_changes;
+
+    ----------------------------------------------------------------
+    -- Step 1: Handle DELETEs (Hard deletes — logical deletion in SCD2)
+    ----------------------------------------------------------------
+    MERGE INTO customer_history AS tgt
+    USING temp_customer_stream AS src
+    ON tgt.customer_id = src.customer_id
+       AND tgt.is_current = TRUE
+       AND src.action = 'DELETE'
+       AND src.is_update = FALSE
+    WHEN MATCHED THEN
+        UPDATE SET
+            tgt.end_time = src.update_timestamp,
+            tgt.is_current = FALSE,
+            tgt.load_timestamp = CURRENT_TIMESTAMP();
+
+    ----------------------------------------------------------------
+    -- Step 2: Handle UPDATEs (delete+insert pair)
+    -- First expire the old record (DELETE + is_update = TRUE)
+    ----------------------------------------------------------------
+    MERGE INTO customer_history AS tgt
+    USING temp_customer_stream AS src
+    ON tgt.customer_id = src.customer_id
+       AND tgt.is_current = TRUE
+       AND src.action = 'DELETE'
+       AND src.is_update = TRUE
+    WHEN MATCHED THEN
+        UPDATE SET
+            tgt.end_time = src.update_timestamp,
+            tgt.is_current = FALSE,
+            tgt.load_timestamp = CURRENT_TIMESTAMP();
+
+    ----------------------------------------------------------------
+    -- Step 3: Handle INSERTs (new records + updated versions)
+    ----------------------------------------------------------------
+    MERGE INTO customer_history AS tgt
+    USING temp_customer_stream AS src
+    ON tgt.customer_id = src.customer_id
+       AND tgt.is_current = TRUE
+    WHEN NOT MATCHED 
+        AND src.action = 'INSERT'
+    THEN INSERT (
+        customer_id,
+        first_name,
+        last_name,
+        email,
+        street,
+        city,
+        state,
+        country,
+        start_time,
+        end_time,
+        is_current,
+        load_timestamp
+    )
+    VALUES (
+        src.customer_id,
+        src.first_name,
+        src.last_name,
+        src.email,
+        src.street,
+        src.city,
+        src.state,
+        src.country,
+        src.update_timestamp,
+        NULL,
+        TRUE,
+        CURRENT_TIMESTAMP()
+    );
+
+    RETURN 'Successfully loaded customer_history SCD2 with DELETE handled separately';
+
+EXCEPTION
+    WHEN OTHER THEN
+        RETURN 'Error loading customer_history: ' || ERROR_MESSAGE();
+END;
+$$;
